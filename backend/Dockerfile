@@ -1,10 +1,11 @@
-FROM python:3.12-slim
+FROM python:3.14-slim
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+RUN pip install uv -i https://mirrors.aliyun.com/pypi/simple/
 
 WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
+ENV UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 RUN uv sync --frozen --no-cache
 
 COPY app ./app
