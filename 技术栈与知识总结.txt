@@ -1,0 +1,484 @@
+项目技术栈与知识总结
+======================
+
+更新时间：2026-11-15
+
+一、项目定位
+------------
+
+Collab Board 是一个“实时协同白板 + 代码评审”应用。用户先创建或加入房间，再在同一房间内：
+
+- 使用白板绘制自由笔迹、矩形、椭圆和文本；
+- 使用 Monaco 编辑器查看代码，并按文件和行号添加评论；
+- 通过 WebSocket 实时接收房间内其他用户的操作和光标；
+- 通过版本号解决同一元素的并发更新冲突。
+
+二、已落地技术栈
+----------------
+
+### 1. 前端
+
+- React 18：组件化 UI 和状态管理。
+- TypeScript 5：定义房间状态、图形、评论、操作和服务端消息类型。
+- Vite 5：前端开发服务器和生产构建。
+- react-konva / Konva：基于 Canvas 的白板渲染和鼠标绘图交互。
+- `@monaco-editor/react` / Monaco Editor：代码评审编辑器。
+- 原生 `fetch`：调用创建房间和加入房间 API。
+- 原生 `WebSocket`：维护房间实时连接。
+
+主要入口和模块：
+
+- `frontend/src/pages/Landing.tsx`：创建/加入房间。
+- `frontend/src/pages/Room.tsx`：房间布局、白板与代码评审页签。
+- `frontend/src/canvas/Whiteboard.tsx`：白板渲染、绘图、远程光标和操作同步。
+- `frontend/src/editor/CodeReviewEditor.tsx`：编辑器和评论创建/删除。
+- `frontend/src/hooks/useWebSocket.ts`：连接、消息分发和 20 秒心跳。
+- `frontend/src/types.ts`：共享 TypeScript 数据结构。
+
+### 2. 后端
+
+- Python 3.14：异步 Web 服务和业务逻辑。
+- FastAPI：HTTP API 与 WebSocket 路由。
+- FastAPI Offline：创建离线可用的 FastAPI 应用文档能力。
+- Pydantic / pydantic-settings：请求模型、类型约束和环境配置。
+- uv：Python 依赖解析、锁定和运行。
+- psycopg 3：异步 PostgreSQL 连接、参数化 SQL 和事务。
+- Redis asyncio 客户端 + hiredis：异步缓存和实时通信。
+
+主要模块：
+
+- `backend/app/main.py`：应用生命周期、房间 API、WebSocket 和快照读取 API。
+- `backend/app/models.py`：房间、图形、评论和协作操作模型。
+- `backend/app/auth.py`：JWT 签发与校验。
+- `backend/app/handlers.py`：操作版本校验、状态写入、历史记录和广播。
+- `backend/app/room_manager.py`：房间连接集合、Stream 回放和 Pub/Sub 分发。
+- `backend/app/snapshot.py`：活跃房间定时快照及最新快照读取。
+- `backend/app/redis_client.py`：Redis key、RedisJSON 状态和元素操作。
+- `backend/app/config.py`：环境变量和默认配置。
+
+### 3. 数据和基础设施
+
+- Redis Stack Server 7.4：通过 Docker Compose 运行。
+  - RedisJSON：保存 `room:{room_id}:state`，包含 `shapes` 和 `comments`。
+  - Redis Streams：保存房间操作历史，默认最大长度由 `STREAM_MAXLEN` 控制。
+  - Redis Pub/Sub：广播操作和临时光标消息。
+- PostgreSQL 16：
+  - `rooms` 保存房间 ID、邀请码和创建时间；
+  - `room_snapshots` 保存 JSONB 房间快照；
+  - `room_id + created_at` 索引支持读取最新快照。
+- Docker Compose：编排 Redis、PostgreSQL、后端和前端。
+
+三、接口和消息协议
+------------------
+
+### HTTP API
+
+- `POST /api/v1/rooms`：创建房间，返回 `room_id`、`invite_code` 和 JWT。
+- `POST /api/v1/rooms/join`：使用 `room_id` 或 `invite_code` 加入房间。
+- `GET /api/v1/health`：返回 `{"ok": true}`。
+- `GET /api/v1/rooms/{room_id}/history`：读取 Redis Stream 操作历史。
+- `GET /api/v1/rooms/{room_id}/snapshot`：读取 PostgreSQL 最新快照，无快照时回退到 Redis 当前状态。
+- `POST /api/v1/_debug/op/{room_id}`：调试用操作入口。
+
+### WebSocket
+
+连接地址：`/ws/{room_id}?token={jwt}`
+
+客户端消息：
+
+- `op`：同步图形或评论的 `add`、`update`、`delete` 操作；
+- `cursor`：广播临时光标位置，不写入持久化状态；
+- `ping`：心跳。
+
+服务端消息：
+
+- `snapshot`：连接建立时发送完整房间状态和当前用户；
+- `op`：操作被接受后广播给房间内客户端；
+- `cursor`：转发其他用户的光标；
+- `pong`：响应心跳；
+- `error`：拒绝操作时返回原因，例如 `stale_version`。
+
+四、核心知识
+------------
+
+本节用项目中的真实代码说明每项知识“解决什么问题、代码如何执行、为什么这样设计”。
+
+### 1. 异步 I/O：让网络等待不阻塞其他房间
+
+后端的数据库和 Redis 操作都是网络 I/O。使用 `async def` 和 `await` 后，当前协程等待数据库响应时，FastAPI 事件循环可以处理其他请求。
+
+代码位置：`backend/app/main.py`
+
+```python
+async def _persist_room(room_id: str, invite_code: str) -> None:
+    async with await psycopg.AsyncConnection.connect(
+        settings.database_url
+    ) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO rooms (room_id, invite_code) VALUES (%s, %s)",
+                (room_id, invite_code),
+            )
+            await conn.commit()
+```
+
+执行过程：
+
+1. `async def` 返回协程，不会立即阻塞当前线程。
+2. `await psycopg.AsyncConnection.connect(...)` 等待 PostgreSQL 连接。
+3. `async with` 自动关闭连接和游标，避免连接泄漏。
+4. 参数通过 `%s` 绑定，而不是拼接字符串，降低 SQL 注入风险。
+5. `await conn.commit()` 使插入事务持久化。
+
+Redis 采用相同模式，例如 `await r.json().get(...)`。异步并不意味着操作更快，而是让一个进程可以高效管理大量并发连接。
+
+### 2. Pydantic 数据建模：把外部 JSON 变成受约束的数据
+
+客户端发送的是普通 JSON，后端需要确认字段类型和允许的值。`backend/app/models.py` 使用 Pydantic 模型和 `Literal` 表达这些约束：
+
+```python
+class ShapeElement(BaseModel):
+    id: str
+    type: Literal["pen", "rect", "ellipse", "text"]
+    x: float
+    y: float
+    width: Optional[float] = None
+    height: Optional[float] = None
+    points: Optional[list[float]] = None
+    text: Optional[str] = None
+    stroke: str = "#3b82f6"
+    version: int = 0
+    deleted: bool = False
+```
+
+例如 `type` 只能是四种图形之一，错误值会在进入业务逻辑前被拒绝。`pen` 使用 `points` 保存路径，矩形和椭圆使用 `width`、`height`，所以不同字段允许为空。
+
+房间接口直接把请求体声明为模型：
+
+```python
+@app.post("/api/v1/rooms")
+async def create_room(req: CreateRoomRequest):
+    room_id = secrets.token_urlsafe(8)
+    invite_code = secrets.token_urlsafe(6)
+    await ensure_state(room_id)
+    await _persist_room(room_id, invite_code)
+    token = create_token(room_id, req.name or "creator")
+    return {"room_id": room_id, "invite_code": invite_code, "token": token}
+```
+
+FastAPI 会负责解析 JSON、创建 `CreateRoomRequest`，然后才调用 `create_room`。这使“数据格式校验”和“创建房间业务”分开。
+
+### 3. JWT 房间鉴权：令牌必须绑定具体房间
+
+代码位置：`backend/app/auth.py`
+
+```python
+def create_token(room_id: str, subject: str) -> str:
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "room_id": room_id,
+            "sub": subject,
+            "iat": now,
+            "exp": now + timedelta(hours=24),
+        },
+        settings.jwt_secret,
+        algorithm=settings.jwt_algoritm,
+    )
+```
+
+令牌包含：
+
+- `room_id`：令牌属于哪个协同房间；
+- `sub`：用户或客户端标识；
+- `iat`：签发时间；
+- `exp`：24 小时后过期。
+
+WebSocket 建立时再次验证：
+
+```python
+payload = verify_token(token)
+if not payload or payload.get("room_id") != room_id:
+    await ws.accept()
+    await ws.close(code=1008)
+    return
+```
+
+只验证 JWT 签名还不够，还要比较 URL 中的 `room_id` 和令牌中的 `room_id`。否则用户可能拿着 A 房间的令牌连接 B 房间。`JWT_SECRET` 必须通过部署环境注入，不能在生产环境使用默认开发密钥。
+
+### 4. Redis key 设计：按房间隔离状态、历史和通知
+
+代码位置：`backend/app/redis_client.py`
+
+```python
+def state_key(room_id: str) -> str:
+    return f"room:{room_id}:state"
+
+def stream_key(room_id: str) -> str:
+    return f"room:{room_id}:stream"
+
+def pubsub_channel(room_id: str) -> str:
+    return f"room:{room_id}:pubsub"
+```
+
+同一个 `room_id` 派生出三类不同 key：
+
+- `room:{id}:state`：当前完整状态；
+- `room:{id}:stream`：操作历史；
+- `room:{id}:pubsub`：实时广播频道。
+
+统一生成 key 的好处是避免不同模块手写字符串产生拼写不一致，也能天然隔离不同房间的数据。
+
+### 5. Redis 三层协作模型：状态、历史、通知各司其职
+
+代码位置：`backend/app/handlers.py`
+
+```python
+async def process_op(room_id: str, payload: dict) -> tuple[bool, str | None]:
+    r = get_redis()
+    await ensure_state(room_id)
+
+    element = payload["data"]
+    etype = payload["elementType"]
+    element_id = element["id"]
+    incoming_version = int(element.get("version", 0))
+
+    existing = await json_get_element(room_id, etype, element_id)
+    if existing and int(existing.get("version", 0)) >= incoming_version:
+        return False, "stale_version"
+
+    if payload["action"] == "delete":
+        await json_delete_element(room_id, etype, element_id)
+    else:
+        await json_set_element(room_id, etype, element)
+
+    await r.xadd(
+        stream_key(room_id),
+        {"opId": payload["opId"], "payload": json.dumps(payload)},
+        maxlen=settings.stream_maxlen,
+        approximate=True,
+    )
+    await r.publish(
+        pubsub_channel(room_id),
+        json.dumps({"type": "op", "payload": payload}),
+    )
+    return True, None
+```
+
+一次操作的职责分工：
+
+1. **RedisJSON** 保存当前状态，连接建立时可以直接发送快照。
+2. **Redis Streams** 记录有限长度的操作历史，空状态时可以回放。
+3. **Redis Pub/Sub** 只负责实时通知当前在线客户端，不负责持久化。
+
+不能把 Pub/Sub 当作历史队列：客户端离线期间不会收到已经发布的消息，所以恢复必须依靠 RedisJSON 快照或 Stream。
+
+### 6. LWW 版本控制：拒绝过期操作
+
+每个图形和评论都有 `version`。服务端先读取旧元素，再比较版本：
+
+```python
+if existing and int(existing.get("version", 0)) >= incoming_version:
+    return False, "stale_version"
+```
+
+假设两个客户端同时编辑版本 3 的评论：
+
+1. 客户端 A 发送版本 4，服务端写入；
+2. 客户端 B 随后也发送版本 4；
+3. 服务端发现当前版本已经是 4，于是拒绝 B 的操作；
+4. B 收到 `error`，原因是 `stale_version`。
+
+前端也做一次保护，避免网络乱序覆盖本地新数据。代码位置：`frontend/src/canvas/shapeUtils.ts` 和 `frontend/src/canvas/Whiteboard.tsx`：
+
+```typescript
+setShapes((prev) => {
+    if (isStale(prev, data)) return prev;
+    versionRef.current = Math.max(versionRef.current, data.version || 0);
+    return { ...prev, [data.id]: data };
+});
+```
+
+服务端是最终裁判，前端判断主要用于避免 UI 因乱序消息闪回旧状态。
+
+### 7. WebSocket 房间管理：一个连接负责收发，一个任务负责广播
+
+客户端在 `frontend/src/hooks/useWebSocket.ts` 中创建连接：
+
+```typescript
+const url = `${WS_BASE}/ws/${roomId}?token=${encodeURIComponent(token)}`;
+const ws = new WebSocket(url);
+
+ws.onopen = () => setConnected(true);
+ws.onmessage = (e) => onMessage(JSON.parse(e.data));
+ws.onclose = () => setConnected(false);
+
+const ping = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "ping", payload: {} }));
+    }
+}, 20000);
+```
+
+服务端的 `RoomConnectionManager` 为每个房间维护连接集合，并为每个房间只创建一个 Redis Pub/Sub 订阅任务。订阅任务收到消息后遍历该房间的连接，把消息发送给所有在线用户。客户端离开时取消任务，避免空房间继续占用资源。
+
+### 8. 心跳和临时光标：持久化数据与瞬态数据分离
+
+白板移动鼠标时发送：
+
+```typescript
+send("cursor", { x: pos.x, y: pos.y });
+```
+
+后端只发布光标消息：
+
+```python
+await r.publish(
+    pubsub_channel(room_id),
+    json.dumps({
+        "type": "cursor",
+        "payload": {**msg["payload"], "sender": user},
+    }),
+)
+```
+
+光标是高频、短暂的数据，不需要写入 RedisJSON 或 Stream。相反，图形和评论需要恢复，因此必须经过 `process_op` 持久化。客户端每 20 秒发送 `ping`，服务端返回 `pong`，用于保持连接和检测断线。
+
+### 9. 快照和恢复：用快照减少历史回放成本
+
+代码位置：`backend/app/snapshot.py`
+
+```python
+async def snapshot_worker(get_active_rooms) -> None:
+    while True:
+        await asyncio.sleep(settings.snapshot_interval)
+        room_ids = get_active_rooms()
+        for room_id in room_ids:
+            await dump_snapshot(room_id)
+```
+
+`dump_snapshot` 从 RedisJSON 读取当前状态并写入 PostgreSQL 的 `room_snapshots.state` JSONB。读取快照时，服务端优先使用 Redis 当前状态；如果状态为空，`room_manager.py` 从 Stream 回放最多 500 条操作。
+
+这是一种“当前状态 + 增量历史”的恢复策略：
+
+- 快照让正常连接不必从头回放所有操作；
+- Stream 让 Redis 状态丢失或刚初始化的房间仍有机会恢复；
+- Stream 有最大长度，不能替代永久审计日志。
+
+### 10. React 乐观更新：先更新 UI，再等待广播确认
+
+评论提交时，前端先更新本地状态，再发送 WebSocket 操作：
+
+```typescript
+const c: CommentElement = {
+    id: makeId(),
+    fileId: "default",
+    lineNumber: selectedLine,
+    text: draft.trim(),
+    author: "you",
+    version: nextVersion(),
+};
+
+setComments((prev) => ({ ...prev, [c.id]: c }));
+send("op", {
+    opId: `${c.id}_${c.version}`,
+    elementType: "comment",
+    action: "add",
+    data: c,
+});
+```
+
+这样用户点击“提交”后立即看到评论，不必等待服务器往返。服务器广播回来时，前端的版本检查会避免重复或旧消息覆盖本地状态。代价是服务器可能拒绝操作，因此正式产品还应在收到 `error` 后显示失败提示或执行回滚。
+
+### 11. Konva 白板：交互坐标转换为可同步元素
+
+白板按“按下、移动、抬起”拆分绘制过程：
+
+```typescript
+const onDown = () => {
+    const pos = stageRef.current?.getPointerPosition() || { x: 0, y: 0 };
+    const shape: ShapeElement = {
+        id: makeId(),
+        type: tool === "pen" ? "pen" : tool === "rect" ? "rect" : "ellipse",
+        x: pos.x,
+        y: pos.y,
+        points: tool === "pen" ? [pos.x, pos.y] : undefined,
+        stroke: "#3b82f6",
+        version: nextVersion(),
+    };
+    drawingRef.current = shape;
+    setShapes((prev) => ({ ...prev, [shape.id]: shape }));
+};
+
+const onUp = () => {
+    const shape = drawingRef.current;
+    if (shape) {
+        send("op", {
+            opId: `${shape.id}_${shape.version}`,
+            elementType: "shape",
+            action: "add",
+            data: shape,
+        });
+        drawingRef.current = null;
+    }
+};
+```
+
+绘制中的对象放在 `drawingRef` 中，避免每个鼠标移动都提交永久操作；松开鼠标后才发送 `add`。渲染时使用 `Object.values(shapes).filter((s) => !s.deleted)`，把数据状态映射为 Konva 的 `Line`、`Rect` 和 `Ellipse`。
+
+### 12. 前后端职责边界
+
+- **前端**：处理鼠标和编辑器交互、本地状态、Canvas 渲染、乐观更新和 WebSocket 展示。
+- **后端**：验证 JWT、检查版本、写入 Redis、记录 Stream、发布消息和管理连接。
+- **Redis**：保存实时状态、有限历史和在线广播。
+- **PostgreSQL**：保存房间元数据和定时快照。
+
+这种分层让前端不需要直接访问数据库，也让后端成为协作一致性的最终来源。
+
+五、运行与配置
+--------------
+
+### Docker Compose
+
+```bash
+docker compose up --build
+```
+
+服务端口：
+
+- 前端 `5173`
+- 后端 `8000`
+- Redis `6379`
+- PostgreSQL `5432`
+
+### 本地开发
+
+```bash
+cd backend
+uv sync
+uv run uvicorn app.main:app --reload
+```
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+后端配置通过环境变量或 `.env` 注入，常用项包括：
+
+- `REDIS_URL`
+- `DATABASE_URL`
+- `JWT_SECRET`
+- `JWT_ALGORITM`（当前配置字段名称，代码中 `algoritm` 拼写待后续统一）
+- `JWT_EXPIRE_HOURS`
+- `SNAPSHOT_INTERVAL`
+- `STREAM_MAXLEN`
+
+六、当前实现边界
+----------------
+
+- `backend/Dockerfile` 当前使用 `python:3.12-slim`，而 `backend/pyproject.toml` 声明的项目运行时下限为 Python 3.14；构建镜像前应统一这两个版本约束。
+- Docker Compose 中的开发密钥和数据库凭据仅适用于本地环境，生产部署必须通过安全的密钥管理方式注入。
+- CORS 当前为开发友好的宽松配置，生产环境应限制允许的来源、方法和请求头。
+- Redis Stream 使用最大长度裁剪，不能把它当作永久审计日志；长期审计需要独立持久化方案。
